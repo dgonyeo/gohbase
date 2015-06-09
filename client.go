@@ -12,6 +12,7 @@ import (
 	"log"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/cznic/b"
 	"github.com/golang/protobuf/proto"
@@ -57,6 +58,12 @@ func (rcc *regionClientCache) put(r *region.Info, c *region.Client) {
 	rcc.m.Unlock()
 }
 
+func (rcc *regionClientCache) del(r *region.Info) {
+	rcc.m.Lock()
+	delete(rcc.clients, r)
+	rcc.m.Unlock()
+}
+
 // key -> region cache.
 type keyRegionCache struct {
 	m sync.Mutex
@@ -88,6 +95,15 @@ func (krc *keyRegionCache) put(key []byte, reg *region.Info) {
 	krc.m.Unlock()
 }
 
+func (krc *keyRegionCache) del(key []byte) {
+	krc.m.Lock()
+	ok := krc.regions.Delete(key)
+	if !ok {
+		// TODO: Something went wrong
+	}
+	krc.m.Unlock()
+}
+
 // A Client provides access to an HBase cluster.
 type Client struct {
 	regions keyRegionCache
@@ -100,81 +116,65 @@ type Client struct {
 	metaClient *region.Client
 
 	zkquorum string
+
+	newClientLock *sync.Mutex
+
+	rpcList     map[hrpc.Call]chan proto.Message
+	rpcListLock *sync.Mutex
 }
 
 // NewClient creates a new HBase client.
 func NewClient(zkquorum string) *Client {
-	return &Client{
+	c := &Client{
 		regions:  keyRegionCache{regions: b.TreeNew(region.CompareGeneric)},
 		clients:  regionClientCache{clients: make(map[*region.Info]*region.Client)},
 		zkquorum: zkquorum,
+
+		newClientLock: &sync.Mutex{},
+
+		rpcList:     make(map[hrpc.Call]chan proto.Message),
+		rpcListLock: &sync.Mutex{},
 	}
+	go c.retryRpcs()
+	return c
 }
 
 // CheckTable returns an error if the given table name doesn't exist.
-func (c *Client) CheckTable(table string) (*pb.GetResponse, error) {
-	resp, err := c.sendRpcToRegion(hrpc.NewGetStr(table, "theKey", nil))
-	if err != nil {
-		return nil, err
-	}
-	return resp.(*pb.GetResponse), err
+func (c *Client) CheckTable(table string) *pb.GetResponse {
+	return c.sendRpc(hrpc.NewGetStr(table, "theKey", nil)).(*pb.GetResponse)
 }
 
 // Get fetches a single row from hbase
-func (c *Client) Get(table string, rowkey string, families map[string][]string) (*pb.GetResponse, error) {
-	resp, err := c.sendRpcToRegion(hrpc.NewGetStr(table, rowkey, families))
-	if err != nil {
-		return nil, err
-	}
-	return resp.(*pb.GetResponse), err
+func (c *Client) Get(table string, rowkey string, families map[string][]string) *pb.GetResponse {
+	return c.sendRpc(hrpc.NewGetStr(table, rowkey, families)).(*pb.GetResponse)
 }
 
 // Scan retrieves the values specified in families from multiple rows in
 // the given hbase table.
-func (c *Client) Scan(table string, families map[string][]string, startRow, stopRow []byte) (*pb.ScanResponse, error) {
-	resp, err := c.sendRpcToRegion(hrpc.NewScanStr(table, families, startRow, stopRow))
-	if err != nil {
-		return nil, err
-	}
-	return resp.(*pb.ScanResponse), err
+func (c *Client) Scan(table string, families map[string][]string, startRow, stopRow []byte) *pb.ScanResponse {
+	return c.sendRpc(hrpc.NewScanStr(table, families, startRow, stopRow)).(*pb.ScanResponse)
 }
 
 // Put inserts or updates the values into the given row the table and rowkey
 // correspond to
-func (c *Client) Put(table string, rowkey string, values map[string]map[string][]byte) (*pb.MutateResponse, error) {
-	resp, err := c.sendRpcToRegion(hrpc.NewPutStr(table, rowkey, values))
-	if err != nil {
-		return nil, err
-	}
-	return resp.(*pb.MutateResponse), err
+func (c *Client) Put(table string, rowkey string, values map[string]map[string][]byte) *pb.MutateResponse {
+	return c.sendRpc(hrpc.NewPutStr(table, rowkey, values)).(*pb.MutateResponse)
 }
 
 // Delete removes values from thw given row the table and rowkey correspond to
-func (c *Client) Delete(table, rowkey string, values map[string]map[string][]byte) (*pb.MutateResponse, error) {
-	resp, err := c.sendRpcToRegion(hrpc.NewDelStr(table, rowkey, values))
-	if err != nil {
-		return nil, err
-	}
-	return resp.(*pb.MutateResponse), err
+func (c *Client) Delete(table, rowkey string, values map[string]map[string][]byte) *pb.MutateResponse {
+	return c.sendRpc(hrpc.NewDelStr(table, rowkey, values)).(*pb.MutateResponse)
 }
 
 // Append appends all given values to their current values in the given row
 // corresponding to the given table and rowkey
-func (c *Client) Append(table, rowkey string, values map[string]map[string][]byte) (*pb.MutateResponse, error) {
-	resp, err := c.sendRpcToRegion(hrpc.NewAppStr(table, rowkey, values))
-	if err != nil {
-		return nil, err
-	}
-	return resp.(*pb.MutateResponse), err
+func (c *Client) Append(table, rowkey string, values map[string]map[string][]byte) *pb.MutateResponse {
+	return c.sendRpc(hrpc.NewAppStr(table, rowkey, values)).(*pb.MutateResponse)
 }
 
 // Increment adds the given values to their corresponding values in hbase
-func (c *Client) Increment(table, rowkey string, values map[string]map[string][]byte) (*pb.MutateResponse, error) {
-	resp, err := c.sendRpcToRegion(hrpc.NewIncStr(table, rowkey, values))
-	if err != nil {
-		return nil, err
-	}
-	return resp.(*pb.MutateResponse), err
+func (c *Client) Increment(table, rowkey string, values map[string]map[string][]byte) *pb.MutateResponse {
+	return c.sendRpc(hrpc.NewIncStr(table, rowkey, values)).(*pb.MutateResponse)
 }
 
 // Creates the META key to search for in order to locate the given key.
@@ -252,7 +252,41 @@ func (c *Client) sendRpcToRegion(rpc hrpc.Call) (proto.Message, error) {
 		}
 	}
 	rpc.SetRegion(reg.RegionName)
+
 	return client.SendRPC(rpc)
+}
+
+// Tries to send an RPC to the correct RegionServer. If there's some error,
+// the RPC is put in the list of RPCs to be retried every 5 seconds, and this
+// thread waits for the RPC to succeed.
+func (c *Client) sendRpc(rpc hrpc.Call) proto.Message {
+	msg, err := c.sendRpcToRegion(rpc)
+	if err == nil {
+		return msg
+	}
+	recvchan := make(chan proto.Message, 1)
+	c.rpcListLock.Lock()
+	c.rpcList[rpc] = recvchan
+	c.rpcListLock.Unlock()
+
+	return <-recvchan
+}
+
+// Every 5 seconds, iterates over the c.rpcList. It attempts to send each RPC,
+// and if it succeeds it sends the result to the corresponding channel.
+func (c *Client) retryRpcs() {
+	for {
+		time.Sleep(time.Second * 5)
+		c.rpcListLock.Lock()
+		for rpc, msgchan := range c.rpcList {
+			msg, err := c.sendRpcToRegion(rpc)
+			if err != nil {
+				msgchan <- msg
+				delete(c.rpcList, rpc)
+			}
+		}
+		c.rpcListLock.Unlock()
+	}
 }
 
 // Locates the region in which the given row key for the given table is.
@@ -314,8 +348,22 @@ func (c *Client) discoverRegion(metaRow *pb.GetResponse) (*region.Client, *regio
 		}
 	}
 
+	c.newClientLock.Lock()
+
+	// It's possible that a thread created a new client since this thread
+	// decided to make a new client
+	_, reginfo := c.regions.get(reg.RegionName)
+	if reginfo != nil {
+		client := c.clients.get(reginfo)
+		if client != nil {
+			c.newClientLock.Unlock()
+			return client, reg, nil
+		}
+	}
+
 	client, err := region.NewClient(host, port)
 	if err != nil {
+		c.newClientLock.Unlock()
 		return nil, nil, err
 	}
 
@@ -334,6 +382,8 @@ func (c *Client) discoverRegion(metaRow *pb.GetResponse) (*region.Client, *regio
 	// acceptable trade-off.  We avoid extra synchronization complexity in
 	// exchange of occasional duplicate work (which should be rare anyway).
 	c.regions.put(reg.RegionName, reg)
+
+	c.newClientLock.Unlock()
 	return client, reg, nil
 }
 
